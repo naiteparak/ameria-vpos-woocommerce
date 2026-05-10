@@ -186,31 +186,85 @@ function ameria_vpos_init_gateway() {
             $is_test_mode = $this->get_option('test_mode', 'yes') === 'yes';
 
             if ($is_test_mode) {
-                $current_test_order_id = (int) get_option('ameria_vpos_test_order_id', 30299000);
-                $ameria_order_id = $current_test_order_id + 1;
-
-                if ($ameria_order_id > 30300000 || $ameria_order_id < 30299001) {
-                    $ameria_order_id = 30299001;
-                }
-
-                update_option('ameria_vpos_test_order_id', $ameria_order_id);
-
                 $amount = 10;
                 $currency = '051';
                 $description = 'WooCommerce test order #' . $order->get_order_number();
-            } else {
-                $attempt = (int) $order->get_meta('_ameria_payment_attempt');
-                $attempt++;
 
-                $ameria_order_id = (int) ($order->get_id() . str_pad((string) $attempt, 2, '0', STR_PAD_LEFT));
 
-                $order->update_meta_data('_ameria_payment_attempt', $attempt);
+                $max_attempts = 50;
+                $last_error = null;
 
-                $amount = (float) $order->get_total();
-                $currency = $this->get_option('currency', '051');
-                $description = 'WooCommerce order #' . $order->get_order_number() . ', attempt #' . $attempt;
+                for ($i = 0; $i < $max_attempts; $i++) {
+                    $current_test_order_id = (int) get_option('ameria_vpos_test_order_id', 30299000);
+                    $ameria_order_id = $current_test_order_id + 1;
+
+                    if ($ameria_order_id > 30300000 || $ameria_order_id < 30299001) {
+                        $ameria_order_id = 30299001;
+                    }
+
+                    update_option('ameria_vpos_test_order_id', $ameria_order_id);
+
+                    $order->update_meta_data('_ameria_order_id', $ameria_order_id);
+                    $order->save();
+
+                    $payload = array(
+                        'ClientID' => $this->get_option('client_id'),
+                        'Username' => $this->get_option('username'),
+                        'Password' => $this->get_option('password'),
+                        'Currency' => $currency,
+                        'Description' => $description,
+                        'OrderID' => $ameria_order_id,
+                        'Amount' => $amount,
+                        'BackURL' => $back_url,
+                        'Opaque' => (string) $order->get_id(),
+                        'Timeout' => 1200,
+                    );
+
+                    $this->debug_note($order, 'Ameria InitPayment payload: ' . wc_print_r($this->mask_payload($payload), true));
+
+                    $response = $this->post_to_ameria('/api/VPOS/InitPayment', $payload);
+
+                    if (is_wp_error($response)) {
+                        return $response;
+                    }
+
+                    if (
+                        !empty($response['PaymentID']) &&
+                        isset($response['ResponseCode']) &&
+                        (string) $response['ResponseCode'] === '1'
+                    ) {
+                        return $response;
+                    }
+
+                    $last_error = !empty($response['ResponseMessage'])
+                        ? $response['ResponseMessage']
+                        : 'Ameria InitPayment failed.';
+
+                    $normalized_error = strtolower($last_error);
+
+                    $should_try_next_order_id =
+                        str_contains($normalized_error, 'order') ||
+                        str_contains($normalized_error, 'duplicate') ||
+                        str_contains($normalized_error, 'incorrect');
+
+                    if (!$should_try_next_order_id) {
+                        break;
+                    }
+
+                    $this->debug_note($order, 'Ameria rejected OrderID ' . $ameria_order_id . '. Trying next OrderID. Message: ' . $last_error);
+                }
+
+                return new WP_Error(
+                    'ameria_init_failed',
+                    $last_error ? $last_error : 'Ameria InitPayment failed after trying multiple OrderIDs.'
+                );
             }
+            $attempt = (int) $order->get_meta('_ameria_payment_attempt');
+            $attempt++;
 
+            $ameria_order_id = (int) ($order->get_id() . str_pad((string) $attempt, 2, '0', STR_PAD_LEFT));
+
+            $order->update_meta_data('_ameria_payment_attempt', $attempt);
             $order->update_meta_data('_ameria_order_id', $ameria_order_id);
             $order->save();
 
@@ -218,10 +272,10 @@ function ameria_vpos_init_gateway() {
                 'ClientID' => $this->get_option('client_id'),
                 'Username' => $this->get_option('username'),
                 'Password' => $this->get_option('password'),
-                'Currency' => $currency,
-                'Description' => $description,
+                'Currency' => $this->get_option('currency', '051'),
+                'Description' => 'WooCommerce order #' . $order->get_order_number() . ', attempt #' . $attempt,
                 'OrderID' => $ameria_order_id,
-                'Amount' => $amount,
+                'Amount' => (float) $order->get_total(),
                 'BackURL' => $back_url,
                 'Opaque' => (string) $order->get_id(),
                 'Timeout' => 1200,
